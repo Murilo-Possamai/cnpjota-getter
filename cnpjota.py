@@ -17,22 +17,23 @@ from colorama import init, Fore, Style
 
 init(autoreset=True)
 
-MAX_WORKERS = 20
+#Quantidade de threads simult, recomendado 5.
+MAX_WORKERS = 5
 csv_lock = threading.Lock()
 print_lock = threading.Lock() 
 
 stop_animation = threading.Event()
+api_pause_lock = threading.Lock()
+api_pause_event = threading.Event()
+api_pause_event.set() 
 
 def safe_print(*args, **kwargs):
-    """Substitui o print padrão garantindo que não atropele a animação"""
     with print_lock:
         sys.stdout.write('\033[2K\r') 
-
         print(*args, **kwargs)
         sys.stdout.flush()
 
 class SafeTqdm(tqdm):
-    """Barra de progresso modificada para respeitar a trava de tela"""
     def display(self, msg=None, pos=None):
         with print_lock:
             sys.stdout.write('\033[2K\r')
@@ -40,7 +41,6 @@ class SafeTqdm(tqdm):
             sys.stdout.flush()
 
 def animate_chroma_logo():
-    """Roda em 2º plano animando a logo com coordenadas fixas"""
     if os.name == 'nt':
         os.system('') 
 
@@ -62,7 +62,6 @@ def animate_chroma_logo():
     while not stop_animation.is_set():
         with print_lock:
             sys.stdout.write('\033[s') 
-
             for r, line in enumerate(logo_lines):
                 colored_line = ""
                 for c, char in enumerate(line):
@@ -71,13 +70,10 @@ def animate_chroma_logo():
                     else:
                         col_idx = ((c // 4) - frame) % len(rainbow)
                         colored_line += rainbow[col_idx] + char
-
                 sys.stdout.write(f"\033[{r+1};1H\033[2K{colored_line}")
 
             sys.stdout.write('\033[0m') 
-
             sys.stdout.write('\033[u')  
-
             sys.stdout.flush()
 
         time.sleep(0.08)
@@ -94,52 +90,208 @@ def format_for_excel(value):
 def format_telefones(telefones):
     if not isinstance(telefones, list):
         return ""
-
     numeros_formatados = []
     for tel in telefones:
         ddd = str(tel.get("ddd", "")).strip()
         numero = str(tel.get("numero", "")).strip()
-
         ddd_limpo = re.sub(r'\D', '', ddd)
         numero_limpo = re.sub(r'\D', '', numero)
-
         if ddd_limpo or numero_limpo:
             numeros_formatados.append(f"{ddd_limpo}{numero_limpo}")
-
     return ", ".join(numeros_formatados)
 
 def format_qsa(qsa):
     if not isinstance(qsa, list):
         return ""
-
     socios_formatados = []
     for socio in qsa:
         nome = socio.get("nome_socio", "N/I")
         cargo = socio.get("qualificacao_socio", "N/I")
         documento = socio.get("cnpj_cpf_socio", "N/I")
-
         socios_formatados.append(f"{nome} ({cargo} - Doc: {documento})")
-
     return " | ".join(socios_formatados)
 
-def fetch_cnpj_data(cnpj):
-    url = f"https://api.opencnpj.org/{cnpj}"
+# =====================================================================
+# BRASILAPI (EXCLUSIVO para consulta única via CMD)
+# =====================================================================
+def fetch_cnpj_data_brasilapi(cnpj):
+    url = f"https://brasilapi.com.br/api/cnpj/v1/{cnpj}"
+    headers = {"User-Agent": "CNPJota-CLI/1.0"}
+
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, headers=headers, timeout=15)
+        
         if response.status_code == 200:
-            return response.json(), None
+            br_data = response.json()
+            
+            data = {
+                "cnpj": br_data.get("cnpj"),
+                "razao_social": br_data.get("razao_social"),
+                "nome_fantasia": br_data.get("nome_fantasia"),
+                "situacao_cadastral": br_data.get("descricao_situacao_cadastral"),
+                "data_situacao_cadastral": br_data.get("data_situacao_cadastral"),
+                "matriz_filial": br_data.get("descricao_identificador_matriz_filial"),
+                "data_inicio_atividade": br_data.get("data_inicio_atividade"),
+                "cnae_principal": f"{br_data.get('cnae_fiscal', '')} - {br_data.get('cnae_fiscal_descricao', '')}",
+                "cnaes_secundarios": br_data.get("cnaes_secundarios", []),
+                "natureza_juridica": br_data.get("natureza_juridica"),
+                "logradouro": br_data.get("logradouro"),
+                "numero": br_data.get("numero"),
+                "complemento": br_data.get("complemento"),
+                "bairro": br_data.get("bairro"),
+                "cep": br_data.get("cep"),
+                "uf": br_data.get("uf"),
+                "municipio": br_data.get("municipio"),
+                "email": br_data.get("email"),
+                "capital_social": br_data.get("capital_social"),
+                "porte_empresa": br_data.get("descricao_porte"),
+                "opcao_simples": "Sim" if br_data.get("opcao_pelo_simples") else "Não",
+                "data_opcao_simples": br_data.get("data_opcao_pelo_simples"),
+                "opcao_mei": "Sim" if br_data.get("opcao_pelo_mei") else "Não",
+                "data_opcao_mei": br_data.get("data_opcao_pelo_mei"),
+                "QSA": []
+            }
+            
+            tels = []
+            tel1 = str(br_data.get("ddd_telefone_1") or "").strip()
+            tel2 = str(br_data.get("ddd_telefone_2") or "").strip()
+            if tel1 and len(tel1) > 2:
+                tels.append({"ddd": tel1[:2], "numero": tel1[2:]})
+            if tel2 and len(tel2) > 2:
+                tels.append({"ddd": tel2[:2], "numero": tel2[2:]})
+            data["telefones"] = tels
+            
+            for socio in br_data.get("qsa", []):
+                data["QSA"].append({
+                    "nome_socio": socio.get("nome_socio"),
+                    "qualificacao_socio": socio.get("qualificacao_socio"),
+                    "cnpj_cpf_socio": socio.get("cnpj_cpf_do_socio")
+                })
+                
+            return data, None
+
         elif response.status_code == 404:
             return None, "Não Encontrado"
-        elif response.status_code == 429:
-            return None, "ERRO API: 429 (Rate Limit)"
         else:
             return None, f"ERRO API: {response.status_code}"
+            
     except Exception as e:
         return None, f"ERRO: {str(e)}"
 
-def process_cnpj(cnpj, headers):
-    data, error = fetch_cnpj_data(cnpj)
+# =====================================================================
+# OPENCNPJ ( EXCLUSIVAMENTE para a lista em lote / CSV)
+# =====================================================================
+def fetch_cnpj_data_opencnpj(cnpj):
+    url = f"https://api.opencnpj.org/{cnpj}"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
 
+    while True:
+        api_pause_event.wait()
+        
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            
+            if response.status_code == 200:
+                return response.json(), None
+            elif response.status_code == 404:
+                return None, "Não Encontrado"
+            elif response.status_code in [429, 403]:
+                with api_pause_lock:
+                    if api_pause_event.is_set():
+                        api_pause_event.clear()
+                        is_lead_thread = True
+                    else:
+                        is_lead_thread = False
+                
+                if is_lead_thread:
+                    safe_print(Fore.RED + Style.BRIGHT + f"\n[!] Bloqueio OpenCNPJ (Erro {response.status_code}).")
+                    for remaining in range(180, 0, -1):
+                        safe_print(Fore.YELLOW + f"[*] Pausa de segurança... Retomando em {remaining} segundos.  ", end='')
+                        time.sleep(1)
+                        
+                    safe_print(Fore.GREEN + Style.BRIGHT + "\n[!] Pausa concluída. Retomando requisições automáticas...     ")
+                    api_pause_event.set()
+                else:
+                    api_pause_event.wait()
+                
+                continue
+            else:
+                return None, f"ERRO API: {response.status_code}"
+                
+        except Exception as e:
+            return None, f"ERRO: {str(e)}"
+
+# =====================================================================
+# Terminal
+# =====================================================================
+def display_single_cnpj_terminal(cnpj_raw):
+    """Consulta rápida usando a BRASILAPI"""
+    cnpj_clean = clean_cnpj(cnpj_raw)
+    
+    if len(cnpj_clean) != 14:
+        safe_print(Fore.RED + f"[X] O CNPJ informado ('{cnpj_raw}') é inválido. Ele deve conter 14 dígitos numéricos.")
+        return
+
+    safe_print(Fore.YELLOW + Style.BRIGHT + f"[*] Consultando CNPJ: {cnpj_clean} (BrasilAPI)...\n")
+    data, error = fetch_cnpj_data_brasilapi(cnpj_clean)
+
+    if error:
+        safe_print(Fore.RED + f"[X] Ocorreu um erro na consulta: {error}")
+        return
+
+    def show_field(label, value):
+        if value and str(value).lower() != "none":
+            safe_print(Fore.CYAN + f"{label}: " + Fore.WHITE + str(value))
+
+    safe_print(Fore.MAGENTA + Style.BRIGHT + "="*60)
+    safe_print(Fore.GREEN + Style.BRIGHT + " 🏢 DADOS DA EMPRESA")
+    safe_print(Fore.MAGENTA + Style.BRIGHT + "="*60)
+
+    show_field("Razão Social", data.get("razao_social"))
+    show_field("Nome Fantasia", data.get("nome_fantasia"))
+    show_field("CNPJ", data.get("cnpj"))
+    show_field("Situação Cadastral", f"{data.get('situacao_cadastral')} (Desde: {data.get('data_situacao_cadastral')})")
+    show_field("Tipo", data.get("matriz_filial"))
+    show_field("Data de Abertura", data.get("data_inicio_atividade"))
+    show_field("CNAE Principal", data.get("cnae_principal"))
+    show_field("Natureza Jurídica", data.get("natureza_juridica"))
+
+    endereco = f"{data.get('logradouro', '')}, {data.get('numero', '')}"
+    if data.get('complemento'):
+        endereco += f" - {data.get('complemento')}"
+    endereco += f" - {data.get('bairro', '')} - {data.get('municipio', '')}/{data.get('uf', '')} - CEP: {data.get('cep', '')}"
+    show_field("Endereço", endereco)
+
+    show_field("Email", data.get("email"))
+    show_field("Telefones", format_telefones(data.get("telefones")))
+
+    if data.get('capital_social'):
+        show_field("Capital Social", f"R$ {data.get('capital_social')}")
+    show_field("Porte da Empresa", data.get("porte_empresa"))
+    show_field("Opção pelo Simples", f"{data.get('opcao_simples')} (Adesão: {data.get('data_opcao_simples', 'N/A')})")
+    show_field("Opção pelo MEI", f"{data.get('opcao_mei')} (Adesão: {data.get('data_opcao_mei', 'N/A')})")
+
+    qsa_raw = data.get("QSA")
+    if qsa_raw and isinstance(qsa_raw, list):
+        safe_print(Fore.MAGENTA + Style.BRIGHT + "\n" + "="*60)
+        safe_print(Fore.GREEN + Style.BRIGHT + " 👥 QUADRO DE SÓCIOS E ADMINISTRADORES (QSA)")
+        safe_print(Fore.MAGENTA + Style.BRIGHT + "="*60)
+        
+        for socio in qsa_raw:
+            nome = socio.get("nome_socio", "N/I")
+            cargo = socio.get("qualificacao_socio", "N/I")
+            doc = socio.get("cnpj_cpf_socio", "N/I")
+            safe_print(Fore.YELLOW + f" • {nome} " + Fore.WHITE + f"({cargo} | Doc: {doc})")
+
+    safe_print(Fore.MAGENTA + Style.BRIGHT + "="*60 + "\n")
+
+def process_cnpj(cnpj, headers):
+    """Consulta em massa usando o OPENCNPJ"""
+    data, error = fetch_cnpj_data_opencnpj(cnpj)
     row = {h: "" for h in headers}
     row["cnpj"] = format_for_excel(cnpj)
 
@@ -151,7 +303,6 @@ def process_cnpj(cnpj, headers):
                 continue
             if key in data and data[key] is not None:
                 val = data[key]
-
                 if key == "telefones":
                     row[key] = format_telefones(val)
                     continue
@@ -196,24 +347,28 @@ def run_gui_selection():
 def main():
     help_text = """
 =========================================================
-  CNPJOTA - Consulta ultra-rápida de CNPJs em lote
+  CNPJOTA - Consulta ultra-rápida de CNPJs
 =========================================================
 
 Como usar:
-  1. Modo Fácil (Interface Gráfica):
+  1. Consulta Única no Terminal:
+     cnpjota 87.921.849/0001-86
+
+  2. Modo Lote (Interface Gráfica):
      cnpjota --select
 
-  2. Modo Terminal (Comandos):
-     cnpjota --listacnpj lista.txt --localsaida C:\\Caminho\\resultado.csv
+  3. Modo Lote (Comandos via Terminal):
+     cnpjota --listacnpj lista.txt --localsaida C:\\saida.csv
 =========================================================
 """
 
     parser = argparse.ArgumentParser(
         description=help_text, 
         formatter_class=argparse.RawTextHelpFormatter,
-        usage="cnpjota [--select] [--listacnpj LISTA] [--localsaida SAIDA]"
+        usage="cnpjota [CNPJ_UNICO] [--select] [--listacnpj LISTA] [--localsaida SAIDA]"
     )
 
+    parser.add_argument("cnpj_unico", nargs="?", help="Consulte um único CNPJ diretamente no terminal")
     parser.add_argument("--select", action="store_true", help="Abre janelas para escolher o arquivo e a pasta de saída.")
     parser.add_argument("--listacnpj", help="Caminho do arquivo .txt contendo os CNPJs")
     parser.add_argument("--localsaida", help="Caminho da pasta ou do arquivo .csv que será gerado")
@@ -234,7 +389,25 @@ Como usar:
 
     try:
         time.sleep(0.2)
-        safe_print(Fore.CYAN + Style.BRIGHT + " Iniciando o utilitário em lote...\n")
+        
+        safe_print(Fore.RED + Style.BRIGHT + "⚠️  AVISO: As informações retornadas podem estar desatualizadas.")
+        safe_print(Fore.YELLOW + "Caso seja importante, realize sempre a pesquisa pelo site oficial da Receita Federal.\n")
+        
+        # MODO ÚNICO -> BRASIL API
+        if args.cnpj_unico:
+            display_single_cnpj_terminal(args.cnpj_unico)
+            
+            stop_animation.set()
+            anim_thread.join(timeout=1.0)
+            
+            sys.stdout.write('\033[?25h')
+            sys.stdout.flush()
+            
+            input(Fore.YELLOW + Style.BRIGHT + "Pressione [ENTER] para sair...")
+            return 
+
+        # MODO LOTE -> OPENCNPJ
+        safe_print(Fore.CYAN + Style.BRIGHT + " Iniciando o utilitário em lote (Via OpenCNPJ)...\n")
 
         if args.select:
             input_path, output_path = run_gui_selection()
@@ -294,11 +467,9 @@ Como usar:
         safe_print(Fore.RED + f"\n[X] Ocorreu um erro inesperado: {str(e)}")
 
     finally:
-
         stop_animation.set()
         anim_thread.join(timeout=1.0)
         sys.stdout.write('\033[?25h') 
-
         sys.stdout.flush()
         print("\n")
 
